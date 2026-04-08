@@ -1,10 +1,11 @@
 # First iteration (prototype simple solution)
 
 import os
+import time
 from typing import List
 from github import Github
 from pydantic import BaseModel, Field
-from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
 import streamlit as st
@@ -40,7 +41,7 @@ def search_github(query: str, limit: int = 3):
 
 # --- 3. AGENT: Analysis Logic ---
 def analyze_repos(repo_list: list, user_query: str):
-    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
     parser = PydanticOutputParser(pydantic_object=RepoAnalysis)
     
     prompt = ChatPromptTemplate.from_template(
@@ -58,6 +59,9 @@ def analyze_repos(repo_list: list, user_query: str):
             "format_instructions": parser.get_format_instructions()
         })
         analyses.append(response)
+        st.write(f"Analyzed: {repo['full_name']}")
+
+        time.sleep(5)
     return analyses
 
 # --- 4. UI: Streamlit Interface ---
@@ -70,6 +74,8 @@ user_input = st.text_input("What kind of project are you looking for?",
 if st.button("Search & Analyze"):
     if not os.getenv("GITHUB_TOKEN"):
         st.error("Please set your GITHUB_TOKEN in the .env file.")
+    elif not os.getenv("GOOGLE_API_KEY"):
+        st.error("Please set your GOOGLE_API_KEY in the .env file.")
     else:
         with st.spinner("Agent is scouting GitHub..."):
             # Step 1: Retrieval
