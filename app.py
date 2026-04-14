@@ -11,6 +11,9 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
 import streamlit as st
 from dotenv import load_dotenv
+from langgraph.graph import StateGraph, END
+from typing import TypedDict, List, Annotated
+import operator
 
 load_dotenv()
 
@@ -32,6 +35,84 @@ class SearchStrategy(BaseModel):
 class FileSelection(BaseModel):
     selected_files: List[str] = Field(description="List of 3-5 specific file paths to read for core logic.")
     reasoning: str = Field(description="Short explanation of why these files look like the entry points.")
+
+class AgentState(TypedDict):
+    user_query: str
+    search_queries: List[str]
+    raw_repos: List[dict]
+    analyzed_results: Annotated[List[RepoAnalysis], operator.add] # Appends results
+    error_count: int
+
+def create_scout_graph():
+    workflow = StateGraph(AgentState)
+
+    # Add Nodes
+    workflow.add_node("strategist", strategist_node)
+    workflow.add_node("retriever", retriever_node)
+    workflow.add_node("architect", architect_node)
+    workflow.add_node("mentor", mentor_node)
+
+    # Define Edges
+    workflow.set_entry_point("strategist")
+    workflow.add_edge("strategist", "retriever")
+
+    # Conditional Logic: Should we continue?
+    def should_analyze(state: AgentState):
+        if not state["raw_repos"]:
+            return "end"
+        return "continue"
+
+    workflow.add_conditional_edges(
+        "retriever",
+        should_analyze,
+        {
+            "continue": "architect",
+            "end": END
+        }
+    )
+
+    workflow.add_edge("architect", "mentor")
+    workflow.add_edge("mentor", END)
+
+    return workflow.compile()
+
+# --- New Node: Strategist ---
+def strategist_node(state: AgentState):
+    with st.spinner("Strategist is planning the search..."):
+        strategy = query_expansion_strategist(state["user_query"])
+        st.write(f"**Strategy Reasoning:** {strategy.reasoning}")
+
+    return {"search_queries": strategy.queries}
+
+def retriever_node(state: AgentState):
+    all_data = []
+    for q in state["search_queries"]:
+        all_data.extend(search_github(q, limit=2))
+    
+    # Deduplicate by full_name
+    unique = list({r['full_name']: r for r in all_data}.values())
+    return {"raw_repos": unique}
+
+def architect_node(state: AgentState):
+    results = []
+    for repo_item in state["raw_repos"]:
+        # Deep code extraction
+        st.write("Analyzing repo ", repo_item['full_name'])
+        core_code, reasoning = extract_core_logic_agentic(
+            repo_item['full_name'], 
+            state["user_query"]
+        )
+        # Final individual analysis
+        analysis = analyze_single_repo(repo_item, core_code, state["user_query"])
+        if analysis:
+            results.append(analysis)
+            st.write(f"Analysis complete for {repo_item['full_name']}")
+            
+    return {"analyzed_results": results}
+
+def mentor_node(state: AgentState):
+    table = compare_top_projects(state["analyzed_results"])
+    return {"comparison_table": table}
 
 def safe_invoke(chain, payload, retries=5):
     for i in range(retries):
@@ -116,7 +197,6 @@ def query_expansion_strategist(user_intent: str):
     - Query 1 should be BROAD (Keywords only).
     - Query 2 should be TARGETED (Keywords + 1 Filter).
     - Query 3 should be ADVANCED (Keywords + Multiple Filters).
-    - Use 'stars:>10' to ensure quality.
 
     ### EXAMPLES
     User Input: "I want to find graph neural networks for protein folding in python"
@@ -216,6 +296,47 @@ def analyze_repos(repo_list: list, user_query: str):
         time.sleep(5) # Stay under 15 RPM
     return analyses
 
+def analyze_single_repo(repo_metadata: dict, core_code: str, user_query: str):
+    """
+    Acts as the 'Technical Lead' to synthesize metadata and source code 
+    into a structured RepoAnalysis object.
+    """
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+    parser = PydanticOutputParser(pydantic_object=RepoAnalysis)
+    
+    prompt = ChatPromptTemplate.from_template(
+        "You are a Senior Technical Lead. A researcher is looking for: '{query}'\n\n"
+        "### REPOSITORY METADATA\n"
+        "Name: {name}\n"
+        "Description: {desc}\n"
+        "Stars: {stars}\n"
+        "Requirements: {reqs}\n\n"
+        "### CORE SOURCE CODE CONTEXT\n"
+        "{code}\n\n"
+        "### TASK\n"
+        "Analyze the provided data. Your 'core_workflow' must be a step-by-step logic workflow "
+        "tracing how the code actually processes input, based on the provided source code.\n\n"
+        "{format_instructions}"
+    )
+    
+    chain = prompt | llm | parser
+    
+    try:
+        response = chain.invoke({
+            "query": user_query,
+            "name": repo_metadata.get('full_name'),
+            "desc": repo_metadata.get('description'),
+            "stars": repo_metadata.get('stars'),
+            "reqs": repo_metadata.get('requirements'),
+            "code": core_code,
+            "format_instructions": parser.get_format_instructions()
+        })
+        return response
+    except Exception as e:
+        # If the LLM fails to parse, we return None so the graph can continue to the next repo
+        print(f"Error analyzing {repo_metadata.get('full_name')}: {e}")
+        return None
+    
 # --- 4. NEW: COMPARISON LOGIC ---
 def compare_top_projects(analyses: List[RepoAnalysis]):
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
@@ -263,53 +384,34 @@ if st.button("Search & Analyze"):
     elif not os.getenv("GOOGLE_API_KEY"):
         st.error("Please set your GOOGLE_API_KEY in the .env file.")
     else:
-        with st.spinner("Strategist is planning the search..."):
-            strategy = query_expansion_strategist(user_input)
-            st.write(f"**Strategy Reasoning:** {strategy.reasoning}")
+        # Initialize Graph
+        scout_app = create_scout_graph()
         
-        with st.spinner("Searching Github..."):
-            # STEP 2: Execute expanded search
-            all_raw_data = []
-            for q in strategy.queries:
-                st.write(f"Searching tag: `{q}`")
-                all_raw_data.extend(search_github(q, limit=2))
+        initial_state = {
+            "user_query": user_input,
+            "search_queries": [],
+            "raw_repos": [],
+            "analyzed_results": [],
+            "comparison_table": ""
+        }
 
-        # Deduplicate results based on full_name
-        unique_data = {repo['full_name']: repo for repo in all_raw_data}.values()
-            
-        if unique_data:
-            # Step 1: Enrich data with code content from the files
-            enriched_data = []
-            for repo_item in unique_data:
-                with st.spinner(f"Reading inner logic for `{repo_item['full_name']}`..."):
-                    core_code, _ = extract_core_logic_agentic(
-                        repo_item['full_name'], 
-                        user_input
-                    )
-
-                    repo_item['core_code_context'] = core_code
-                    
-                    enriched_data.append(repo_item)
-
-            with st.spinner("Generating deep analysis..."):
-                # Step 2: Individual Analysis
-                results = analyze_repos(enriched_data, user_input)
+        with st.spinner("🚀 Agentic Graph in progress..."):
+            # Run the entire graph
+            final_state = scout_app.invoke(initial_state)
                 
-            with st.spinner("Generating comparisons..."):
-                # Step 3: Synthesis Table
-                st.header("✨Comparison of Top Projects")
-                table = compare_top_projects(results)
-                st.markdown(table)
-            
-            with st.spinner("Generating detailed results for each repository..."):
-                # Step 4: Individual Expanders
-                st.header("📂 Detailed Results")
-                for res in results:
-                    with st.expander(f"📁 {res.name} ({res.stars} ⭐)"):
-                        st.write(f"**Summary:** {res.summary}")
-                        st.write(f"**Workflow:** {res.core_workflow}")
-                        st.write(f"**Techstack:** `{', '.join(res.tech_stack)}`")
-                        st.write(f"**Key learnings:** `{', '.join(res.key_learnings)}`")
-                        st.write(f"**Activity status:** {res.activity_status}")
+        if final_state.get("comparison_table"):
+            st.header("✨ Comparison of Top Projects")
+            st.markdown(final_state["comparison_table"])
+
+        if final_state.get("analyzed_results"):
+            # Step 4: Individual Expanders
+            st.header("📂 Detailed Results")
+            for res in final_state["analyzed_results"]:
+                with st.expander(f"📁 {res.name} ({res.stars} ⭐)"):
+                    st.write(f"**Summary:** {res.summary}")
+                    st.write(f"**Workflow:** {res.core_workflow}")
+                    st.write(f"**Techstack:** `{', '.join(res.tech_stack)}`")
+                    st.write(f"**Key learnings:** `{', '.join(res.key_learnings)}`")
+                    st.write(f"**Activity status:** {res.activity_status}")
         else:
             st.warning("No relevant projects found.")
