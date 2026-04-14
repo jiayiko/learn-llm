@@ -42,6 +42,7 @@ class AgentState(TypedDict):
     raw_repos: List[dict]
     analyzed_results: Annotated[List[RepoAnalysis], operator.add] # Appends results
     error_count: int
+    comparison_table: str
 
 def create_scout_graph():
     workflow = StateGraph(AgentState)
@@ -95,19 +96,23 @@ def retriever_node(state: AgentState):
 
 def architect_node(state: AgentState):
     results = []
-    for repo_item in state["raw_repos"]:
-        # Deep code extraction
-        st.write("Analyzing repo ", repo_item['full_name'])
-        core_code, reasoning = extract_core_logic_agentic(
-            repo_item['full_name'], 
-            state["user_query"]
-        )
-        # Final individual analysis
-        analysis = analyze_single_repo(repo_item, core_code, state["user_query"])
-        if analysis:
-            results.append(analysis)
-            st.write(f"Analysis complete for {repo_item['full_name']}")
-            
+    try:
+        for repo_item in state["raw_repos"]:
+            # Deep code extraction
+            st.write("Analyzing repo ", repo_item['full_name'])
+            core_code, reasoning = extract_core_logic_agentic(
+                repo_item['full_name'], 
+                state["user_query"]
+            )
+            # Final individual analysis
+            analysis = analyze_single_repo(repo_item, core_code, state["user_query"])
+            if analysis:
+                results.append(analysis)
+                st.write(f"Analysis complete for {repo_item['full_name']}")
+
+    except Exception as e:
+        print(f"General error in architect node: {e}")
+
     return {"analyzed_results": results}
 
 def mentor_node(state: AgentState):
@@ -144,7 +149,7 @@ def get_file_structure(repo_full_name: str):
         return f"Error mapping tree: {e}"
     
 def extract_core_logic_agentic(repo_full_name: str, user_intent: str):
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0)
     parser = PydanticOutputParser(pydantic_object=FileSelection)
     
     # Pass 1: Get the Map
@@ -181,7 +186,7 @@ def extract_core_logic_agentic(repo_full_name: str, user_intent: str):
     return combined_code, selection.reasoning
 
 def query_expansion_strategist(user_intent: str):
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.2)
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0.2)
     parser = PydanticOutputParser(pydantic_object=SearchStrategy)
 
     prompt_content = """
@@ -269,7 +274,7 @@ def search_github(query: str, limit: int = 3):
 
 # --- 3. AGENT: Multi-Stage Analysis ---
 def analyze_repos(repo_list: list, user_query: str):
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0)
     parser = PydanticOutputParser(pydantic_object=RepoAnalysis)
     
     prompt = ChatPromptTemplate.from_template(
@@ -301,7 +306,7 @@ def analyze_single_repo(repo_metadata: dict, core_code: str, user_query: str):
     Acts as the 'Technical Lead' to synthesize metadata and source code 
     into a structured RepoAnalysis object.
     """
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0)
     parser = PydanticOutputParser(pydantic_object=RepoAnalysis)
     
     prompt = ChatPromptTemplate.from_template(
@@ -339,8 +344,8 @@ def analyze_single_repo(repo_metadata: dict, core_code: str, user_query: str):
     
 # --- 4. NEW: COMPARISON LOGIC ---
 def compare_top_projects(analyses: List[RepoAnalysis]):
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
-    
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0)
+    st.write(f"Comparing {len(analyses)} projects")
     # Context building
     detailed_context = ""
     for idx, a in enumerate(analyses):
@@ -368,8 +373,12 @@ def compare_top_projects(analyses: List[RepoAnalysis]):
     | Project | Complexity | You Will Learn How To | Best If You Want To |
     """
     
-    response = llm.invoke(compare_prompt)
-    return response.content
+    try:
+        response = llm.invoke(compare_prompt)
+        return response.content
+    except Exception as e:
+        st.write(f"Error during comparison: {e}")
+        return "Comparison failed due to an error."
 
 # --- 4. UI: Streamlit Interface ---
 st.set_page_config(page_title="GitHub Project Scout", page_icon="🚀")
@@ -411,7 +420,7 @@ if st.button("Search & Analyze"):
                     st.write(f"**Summary:** {res.summary}")
                     st.write(f"**Workflow:** {res.core_workflow}")
                     st.write(f"**Techstack:** `{', '.join(res.tech_stack)}`")
-                    st.write(f"**Key learnings:** `{', '.join(res.key_learnings)}`")
+                    st.write(f"**Key learnings:** {', '.join(res.key_learnings)}")
                     st.write(f"**Activity status:** {res.activity_status}")
         else:
             st.warning("No relevant projects found.")
