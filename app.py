@@ -111,30 +111,29 @@ def strategist_node(state: AgentState):
 
     return {"search_queries": strategy.queries}
 
-def retriever_node(state: AgentState, num_repos: int = 3):
+def retriever_node(state: AgentState):
     all_raw_data = []
-    embedder = load_embedder()
+    embedder = load_embedder() # Assumes cached SentenceTransformer('all-MiniLM-L6-v2')
     
-    # 1. Broad Retrieval (Fetch 10 per query to get a good candidate pool)
+    # 1. Broad Retrieval from GitHub API
     for q in state["search_queries"]:
-        fetched = search_github(q, fetch_limit=10)
-        all_raw_data.extend(fetched)
+        all_raw_data.extend(search_github(q, fetch_limit=10))
     
     # 2. Deduplicate
     unique_repos = list({r['full_name']: r for r in all_raw_data}.values())
-    
-    if not unique_repos:
-        return {"raw_repos": []}
 
-    # 3. Compute Scores and Re-rank
-    # Pass the user's intent and the expanded terms for a richer comparison
-    target_intent = f"{state['user_query']} {' '.join(state.get('expanded_terms', []))}"
-    ranked_repos = rank_with_metrics(unique_repos, target_intent, embedder)
+    # 3. Multi-Vector Re-Ranking
+    ranked_repos = rank_weighted_semantic(
+        repos=unique_repos,
+        keywords=state.get("keywords", []),
+        expansions=state.get("expanded_terms", []),
+        embedder=embedder,
+        w1=0.7, # Priority on user's specific keywords
+        w2=0.3  # Additional for technical depth/synonyms
+    )
     
-    # 4. Selection: Take top num_repos for deep analysis
-    top_repos = ranked_repos[:num_repos]
-    
-    return {"raw_repos": top_repos}
+    # Take top 3 for the Architect Node to analyze
+    return {"raw_repos": ranked_repos[:3]}
 
 def architect_node(state: AgentState):
     results = []
@@ -335,33 +334,50 @@ def search_github(query: str, fetch_limit: int = 10):
         })
     return results
 
-def rank_with_metrics(repos, target_text, embedder):
-    # Prepare the corpus (Name + Description + Topics + snippet of README)
+def rank_weighted_semantic(repos, keywords, expansions, embedder, w1=0.7, w2=0.3):
+    """
+    Computes two separate scores and merges them using a weighted sum.
+    w1: Weight for User Keywords (The Anchor)
+    w2: Weight for Expanded Terms (The Context)
+    """
+    if not repos:
+        return []
+
+    # 1. Prepare Target Strings
+    keyword_target = " ".join(keywords)
+    expansion_target = " ".join(expansions)
+
+    # 2. Prepare Corpus (Metadata + README snippet)
     corpus = [
         f"{r['full_name']} {r['description']} {' '.join(r['topics'])} {r['readme'][:500]}"
         for r in repos
     ]
 
-    # --- 1. Sentence Transformer Scoring (Primary eval) ---
-    query_emb = embedder.encode(target_text, convert_to_tensor=True)
+    # 3. Generate Embeddings
+    kw_emb = embedder.encode(keyword_target, convert_to_tensor=True)
+    ex_emb = embedder.encode(expansion_target, convert_to_tensor=True)
     corpus_embs = embedder.encode(corpus, convert_to_tensor=True)
-    semantic_scores = util.cos_sim(query_emb, corpus_embs)[0].tolist()
 
-    # --- 2. TF-IDF Scoring (Logging Only) ---
-    tfidf_vec = TfidfVectorizer()
-    # Transform query and corpus into the same space
-    tfidf_matrix = tfidf_vec.fit_transform([target_text] + corpus)
-    tfidf_scores = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:])[0]
+    # 4. Compute Separate Cosine Similarities
+    # util.cos_sim returns a matrix; we take the first row and convert to list
+    kw_scores = util.cos_sim(kw_emb, corpus_embs)[0].tolist()
+    ex_scores = util.cos_sim(ex_emb, corpus_embs)[0].tolist()
 
-    # --- 3. Combine and Log ---
+    # 5. Calculate Weighted Sum and Log Metrics
     for i, repo in enumerate(repos):
-        repo["semantic_score"] = round(float(semantic_scores[i]), 4)
-        repo["tfidf_score"] = round(float(tfidf_scores[i]), 4)
+        s_kw = float(kw_scores[i])
+        s_ex = float(ex_scores[i])
         
-        # Log to Streamlit console or terminal
-        st.write(f"Repo: {repo['full_name']} | Semantic: {repo['semantic_score']} | TF-IDF: {repo['tfidf_score']}")
+        # The Final Weighted Score
+        repo["semantic_score"] = round((s_kw * w1) + (s_ex * w2), 4)
+        
+        # Individual scores for logging/debugging
+        repo["kw_match"] = round(s_kw, 4)
+        repo["ex_match"] = round(s_ex, 4)
+        
+        print(f"[{repo['full_name']}] Total: {repo['semantic_score']} (KW: {s_kw} | EX: {s_ex})")
 
-    # Sort by semantic score
+    # 6. Sort by the combined weighted score
     return sorted(repos, key=lambda x: x["semantic_score"], reverse=True)
 
 # --- 3. AGENT: Multi-Stage Analysis ---
