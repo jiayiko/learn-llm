@@ -14,23 +14,43 @@ from dotenv import load_dotenv
 from langgraph.graph import StateGraph, END
 from typing import TypedDict, List, Annotated
 import operator
+from sentence_transformers import SentenceTransformer, util
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
 
 load_dotenv()
+
+@st.cache_resource
+def load_embedder():
+    return SentenceTransformer('all-MiniLM-L6-v2')
 
 # --- 1. PROXY ML SYSTEM: Structured Data Schema ---
 class RepoAnalysis(BaseModel):
     name: str = Field(description="Full name of the repository")
     summary: str = Field(description="A brief technical overview")
-    tech_stack: List[str] = Field(description="Specific libraries found in requirements.txt or README")
+    language: str = Field(description="Programming language used")
+    tech_stack: List[str] = Field(description="Specific libraries found in requirements.txt, README, package.json, or other similar files")
     core_workflow: str = Field(description="Logic workflow summary of how the project works end-to-end based on the core_code_context and README")
     key_learnings: List[str] = Field(description="3-4 specific concepts or patterns a user will learn by doing this project")
     complexity_level: str = Field(description="Beginner, Intermediate, or Advanced based on code structure")
     activity_status: str = Field(description="Maintenance status based on commit dates")
     stars: int = Field(description="Number of stars")
+    forks: int = Field(description="Number of forks")
 
 class SearchStrategy(BaseModel):
-    queries: List[str] = Field(description="A list of 3-5 optimized GitHub search strings using keywords, 'topic:', and 'language:' filters.")
-    reasoning: str = Field(description="Brief explanation of why these specific filters were chosen.")
+    queries: List[str] = Field(
+        description="A list of 3 distinct GitHub search strings (Broad, Formal, and Academic)."
+    )
+    expanded_terms: List[str] = Field(
+        description="Technical synonyms, acronyms, and related algorithms identified from the intent."
+    )
+    reasoning: str = Field(
+        description="Brief technical justification for why these specific expansion terms were chosen."
+    )
+    keywords: List[str] = Field(
+        description="Core keywords strictly derived from the user input. These should closely match the user's original wording or very near paraphrases, without introducing new technical concepts."
+    )
 
 class FileSelection(BaseModel):
     selected_files: List[str] = Field(description="List of 3-5 specific file paths to read for core logic.")
@@ -81,18 +101,40 @@ def create_scout_graph():
 def strategist_node(state: AgentState):
     with st.spinner("Strategist is planning the search..."):
         strategy = query_expansion_strategist(state["user_query"])
+
+        # Logging
+        st.write("**Generated Search Queries:**")
+        for i, query in enumerate(strategy.queries, start=1):
+            st.write(f"{i}. {query}")
+        st.write(f"**Expanded Terms:** {', '.join(strategy.expanded_terms)}")
         st.write(f"**Strategy Reasoning:** {strategy.reasoning}")
 
     return {"search_queries": strategy.queries}
 
-def retriever_node(state: AgentState):
-    all_data = []
-    for q in state["search_queries"]:
-        all_data.extend(search_github(q, limit=2))
+def retriever_node(state: AgentState, num_repos: int = 3):
+    all_raw_data = []
+    embedder = load_embedder()
     
-    # Deduplicate by full_name
-    unique = list({r['full_name']: r for r in all_data}.values())
-    return {"raw_repos": unique}
+    # 1. Broad Retrieval (Fetch 10 per query to get a good candidate pool)
+    for q in state["search_queries"]:
+        fetched = search_github(q, fetch_limit=10)
+        all_raw_data.extend(fetched)
+    
+    # 2. Deduplicate
+    unique_repos = list({r['full_name']: r for r in all_raw_data}.values())
+    
+    if not unique_repos:
+        return {"raw_repos": []}
+
+    # 3. Compute Scores and Re-rank
+    # Pass the user's intent and the expanded terms for a richer comparison
+    target_intent = f"{state['user_query']} {' '.join(state.get('expanded_terms', []))}"
+    ranked_repos = rank_with_metrics(unique_repos, target_intent, embedder)
+    
+    # 4. Selection: Take top num_repos for deep analysis
+    top_repos = ranked_repos[:num_repos]
+    
+    return {"raw_repos": top_repos}
 
 def architect_node(state: AgentState):
     results = []
@@ -190,24 +232,46 @@ def query_expansion_strategist(user_intent: str):
     parser = PydanticOutputParser(pydantic_object=SearchStrategy)
 
     prompt_content = """
-    You are a GitHub Search Architect. Your goal is to transform a user's research intent into high-precision GitHub API queries.
+    You are a Technical Search Architect. Your goal is to map a user's research intent into 
+    highly accurate GitHub search queries by expanding technical semantics.
 
-    ### GOAL
-    Break down the input into two parts:
-    1. KEYWORDS: The core technical concepts (e.g., "GNN", "Protein").
-    2. FILTERS: Metadata constraints (e.g., "language:python", "topic:bioinformatics").
+    ---
+    
+    ## OUTPUT COMPONENTS
+    ### 1. Keywords (STRICT INTENT ANCHOR)
+    - **Scope**: Extract 4-8 core keywords EXPLICITLY mentioned in the user's input that are essential to the topic.
+    - **Rule**: DO NOT introduce new concepts or inferred terms here.
+    - **Purpose**: ensure strict alignment with user intent
+    Examples: "rag chatbot with memory" → ["rag", "chatbot", "memory"]
 
-    ### RULES
-    - Generate 3 distinct queries.
-    - Query 1 should be BROAD (Keywords only).
-    - Query 2 should be TARGETED (Keywords + 1 Filter).
-    - Query 3 should be ADVANCED (Keywords + Multiple Filters).
+    ### 2. Expanded Terms (SEMANTIC EXPANSION)
+    - **Scope**: Generate 5-10 inferred technical synonyms, acronyms, underlying algorithms, frameworks, or field-specific terminology.
+    - **Purpose**: These ensure we find repos that use different but standard naming conventions.
+    Examples: "Pathfinding" -> "A*", "Dijkstra", "Search Algorithm"
+
+    ### 3. Queries (SEARCH STRATEGY)
+    Generate distinct 3 GitHub search queries:
+    - Query 1: **Acronym & Short-hand Focus** (High precision for community-standard terms).
+    - Query 2: **Formal Name & Documentation Focus** (Targeting full terminology in target documentation (`in:readme`, `in:description`)).
+    - Query 3: **Academic/Problem-Space Focus** (Targeting the underlying methods, architectures, or problem framing).
+    - **STRICTLY NO** filters for stars, dates, or maintenance. Focus purely on technical content match.
+
+    ---
 
     ### EXAMPLES
-    User Input: "I want to find graph neural networks for protein folding in python"
-    Query 1: "graph neural network protein folding"
-    Query 2: "graph neural network protein topic:gnn"
-    Query 3: "gnn protein-folding language:python stars:>10"
+    User Input: "Self-driving car lane detection using computer vision"
+    Query 1: "lane detection CV autonomous"
+    Query 2: "'hough transform' lane-marking in:readme"
+    Query 3: "perception-pipeline 'semantic segmentation' automotive"
+    Keywords: ["lane detection", "self-driving car", "computer vision"]
+    Expanded Terms: ["hough transform", "semantic segmentation", "edge detection", "perception pipeline"]
+
+    User Input: "Low latency key-value store in Rust"
+    Query 1: "kv-store rust latency"
+    Query 2: "'key value store' storage engine in:description"
+    Query 3: "LSM-tree storage-engine 'zero-copy' language:rust"
+    Keywords: ["low latency", "key-value store", "rust"]
+    Expanded Terms: ["kv-store", "distributed hash table", "lsm-tree", "storage engine", "zero-copy"]
 
     User Input: "{intent}"
 
@@ -250,27 +314,55 @@ def get_readme(repo_full_name: str):
     except:
         return "Not found"
 
-def search_github(query: str, limit: int = 3):
+def search_github(query: str, fetch_limit: int = 10):
     g = Github(os.getenv("GITHUB_TOKEN"))
-    repos = g.search_repositories(query=query, sort="stars", order="desc")
-
-    if repos.totalCount == 0:
-        return []
+    repos = g.search_repositories(query=query, sort="indexed", order="desc")
     
     results = []
-    for repo in repos[:limit]:
-        readme = get_readme(repo.full_name)
-        requirements = get_requirements(repo.full_name)
-
+    # Using a simple counter to respect the fetch_limit
+    for i, repo in enumerate(repos):
+        if i >= fetch_limit: break
+        
         results.append({
             "full_name": repo.full_name,
-            "description": repo.description,
+            "description": repo.description or "",
+            "readme": get_readme(repo.full_name) or "",
+            "topics": repo.get_topics(),
             "stars": repo.stargazers_count,
-            "last_commit": repo.pushed_at.strftime("%Y-%m-%d"),
-            "readme": readme,
-            "requirements": requirements
+            "forks": repo.forks_count,
+            "language": repo.language,
+            "last_commit": repo.pushed_at.strftime("%Y-%m-%d")
         })
     return results
+
+def rank_with_metrics(repos, target_text, embedder):
+    # Prepare the corpus (Name + Description + Topics + snippet of README)
+    corpus = [
+        f"{r['full_name']} {r['description']} {' '.join(r['topics'])} {r['readme'][:500]}"
+        for r in repos
+    ]
+
+    # --- 1. Sentence Transformer Scoring (Primary eval) ---
+    query_emb = embedder.encode(target_text, convert_to_tensor=True)
+    corpus_embs = embedder.encode(corpus, convert_to_tensor=True)
+    semantic_scores = util.cos_sim(query_emb, corpus_embs)[0].tolist()
+
+    # --- 2. TF-IDF Scoring (Logging Only) ---
+    tfidf_vec = TfidfVectorizer()
+    # Transform query and corpus into the same space
+    tfidf_matrix = tfidf_vec.fit_transform([target_text] + corpus)
+    tfidf_scores = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:])[0]
+
+    # --- 3. Combine and Log ---
+    for i, repo in enumerate(repos):
+        repo["semantic_score"] = round(float(semantic_scores[i]), 4)
+        repo["tfidf_score"] = round(float(tfidf_scores[i]), 4)
+        
+        # Log to Streamlit console or terminal
+        st.write(f"Repo: {repo['full_name']} | Semantic: {repo['semantic_score']} | TF-IDF: {repo['tfidf_score']}")
+
+    # Sort by semantic score
+    return sorted(repos, key=lambda x: x["semantic_score"], reverse=True)
 
 # --- 3. AGENT: Multi-Stage Analysis ---
 def analyze_repos(repo_list: list, user_query: str):
