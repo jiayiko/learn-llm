@@ -21,6 +21,8 @@ import numpy as np
 
 load_dotenv()
 
+model_name = "gemini-2.5-pro"
+
 @st.cache_resource
 def load_embedder():
     return SentenceTransformer('all-MiniLM-L6-v2')
@@ -58,7 +60,7 @@ class FileSelection(BaseModel):
 
 class AgentState(TypedDict):
     user_query: str
-    search_queries: List[str]
+    search_strategy: SearchStrategy
     raw_repos: List[dict]
     analyzed_results: Annotated[List[RepoAnalysis], operator.add] # Appends results
     error_count: int
@@ -106,17 +108,24 @@ def strategist_node(state: AgentState):
         st.write("**Generated Search Queries:**")
         for i, query in enumerate(strategy.queries, start=1):
             st.write(f"{i}. {query}")
+        st.write(f"**Keywords:** {', '.join(strategy.keywords)}")
         st.write(f"**Expanded Terms:** {', '.join(strategy.expanded_terms)}")
         st.write(f"**Strategy Reasoning:** {strategy.reasoning}")
 
-    return {"search_queries": strategy.queries}
+    return {"search_strategy": strategy}
 
 def retriever_node(state: AgentState):
     all_raw_data = []
     embedder = load_embedder() # Assumes cached SentenceTransformer('all-MiniLM-L6-v2')
+
+    strategy = state.get("search_strategy")
+
+    # --- Safety check ---
+    if strategy is None:
+        return {"raw_repos": []}
     
     # 1. Broad Retrieval from GitHub API
-    for q in state["search_queries"]:
+    for q in strategy.queries:
         all_raw_data.extend(search_github(q, fetch_limit=10))
     
     # 2. Deduplicate
@@ -125,8 +134,8 @@ def retriever_node(state: AgentState):
     # 3. Multi-Vector Re-Ranking
     ranked_repos = rank_weighted_semantic(
         repos=unique_repos,
-        keywords=state.get("keywords", []),
-        expansions=state.get("expanded_terms", []),
+        keywords=strategy.keywords or [],
+        expansions=strategy.expanded_terms or [],
         embedder=embedder,
         w1=0.7, # Priority on user's specific keywords
         w2=0.3  # Additional for technical depth/synonyms
@@ -152,7 +161,7 @@ def architect_node(state: AgentState):
                 st.write(f"Analysis complete for {repo_item['full_name']}")
 
     except Exception as e:
-        print(f"General error in architect node: {e}")
+        st.write(f"General error in architect node: {e}")
 
     return {"analyzed_results": results}
 
@@ -167,7 +176,7 @@ def safe_invoke(chain, payload, retries=5):
         except Exception as e:
             if "429" in str(e) or "503" in str(e):
                 wait = 2 ** i
-                print(f"Retrying in {wait}s...")
+                st.write(f"Retrying in {wait}s...")
                 time.sleep(wait)
             else:
                 raise e
@@ -190,7 +199,7 @@ def get_file_structure(repo_full_name: str):
         return f"Error mapping tree: {e}"
     
 def extract_core_logic_agentic(repo_full_name: str, user_intent: str):
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0)
+    llm = ChatGoogleGenerativeAI(model=model_name, temperature=0)
     parser = PydanticOutputParser(pydantic_object=FileSelection)
     
     # Pass 1: Get the Map
@@ -227,7 +236,7 @@ def extract_core_logic_agentic(repo_full_name: str, user_intent: str):
     return combined_code, selection.reasoning
 
 def query_expansion_strategist(user_intent: str):
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0.2)
+    llm = ChatGoogleGenerativeAI(model=model_name, temperature=0.2)
     parser = PydanticOutputParser(pydantic_object=SearchStrategy)
 
     prompt_content = """
@@ -315,12 +324,23 @@ def get_readme(repo_full_name: str):
 
 def search_github(query: str, fetch_limit: int = 10):
     g = Github(os.getenv("GITHUB_TOKEN"))
-    repos = g.search_repositories(query=query, sort="indexed", order="desc")
+    repos = g.search_repositories(query=query, sort="stars", order="desc")
     
     results = []
     # Using a simple counter to respect the fetch_limit
     for i, repo in enumerate(repos):
         if i >= fetch_limit: break
+
+        # --- HEURISTIC FILTERING ---
+        low_quality_terms = ["awesome-", "-list", "curated", "collection"]
+        if any(term in repo.full_name.lower() for term in low_quality_terms):
+            continue
+
+        if repo.size < 100:
+            continue
+    
+        if repo.fork:
+            continue
         
         results.append({
             "full_name": repo.full_name,
@@ -332,6 +352,10 @@ def search_github(query: str, fetch_limit: int = 10):
             "language": repo.language,
             "last_commit": repo.pushed_at.strftime("%Y-%m-%d")
         })
+
+    st.write("Query: ", query)
+    for r in results:
+        st.write("- ", r['full_name'])
     return results
 
 def rank_weighted_semantic(repos, keywords, expansions, embedder, w1=0.7, w2=0.3):
@@ -349,7 +373,7 @@ def rank_weighted_semantic(repos, keywords, expansions, embedder, w1=0.7, w2=0.3
 
     # 2. Prepare Corpus (Metadata + README snippet)
     corpus = [
-        f"{r['full_name']} {r['description']} {' '.join(r['topics'])} {r['readme'][:500]}"
+        f"{r['full_name'].split('/')[1]} {r['description']} {' '.join(r['topics'])} {r['readme'][:1500]}"
         for r in repos
     ]
 
@@ -375,14 +399,14 @@ def rank_weighted_semantic(repos, keywords, expansions, embedder, w1=0.7, w2=0.3
         repo["kw_match"] = round(s_kw, 4)
         repo["ex_match"] = round(s_ex, 4)
         
-        print(f"[{repo['full_name']}] Total: {repo['semantic_score']} (KW: {s_kw} | EX: {s_ex})")
+        st.write(f"[{repo['full_name']}] Total: {repo['semantic_score']} (KW: {s_kw} | EX: {s_ex})")
 
     # 6. Sort by the combined weighted score
     return sorted(repos, key=lambda x: x["semantic_score"], reverse=True)
 
 # --- 3. AGENT: Multi-Stage Analysis ---
 def analyze_repos(repo_list: list, user_query: str):
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0)
+    llm = ChatGoogleGenerativeAI(model=model_name, temperature=0)
     parser = PydanticOutputParser(pydantic_object=RepoAnalysis)
     
     prompt = ChatPromptTemplate.from_template(
@@ -414,7 +438,7 @@ def analyze_single_repo(repo_metadata: dict, core_code: str, user_query: str):
     Acts as the 'Technical Lead' to synthesize metadata and source code 
     into a structured RepoAnalysis object.
     """
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0)
+    llm = ChatGoogleGenerativeAI(model=model_name, temperature=0)
     parser = PydanticOutputParser(pydantic_object=RepoAnalysis)
     
     prompt = ChatPromptTemplate.from_template(
@@ -447,12 +471,12 @@ def analyze_single_repo(repo_metadata: dict, core_code: str, user_query: str):
         return response
     except Exception as e:
         # If the LLM fails to parse, we return None so the graph can continue to the next repo
-        print(f"Error analyzing {repo_metadata.get('full_name')}: {e}")
+        st.write(f"Error analyzing {repo_metadata.get('full_name')}: {e}")
         return None
     
 # --- 4. NEW: COMPARISON LOGIC ---
 def compare_top_projects(analyses: List[RepoAnalysis]):
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0)
+    llm = ChatGoogleGenerativeAI(model=model_name, temperature=0)
     st.write(f"Comparing {len(analyses)} projects")
     # Context building
     detailed_context = ""
@@ -506,7 +530,7 @@ if st.button("Search & Analyze"):
         
         initial_state = {
             "user_query": user_input,
-            "search_queries": [],
+            "search_strategy": None,
             "raw_repos": [],
             "analyzed_results": [],
             "comparison_table": ""
