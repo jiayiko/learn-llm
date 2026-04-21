@@ -21,7 +21,7 @@ import numpy as np
 
 load_dotenv()
 
-model_name = "gemini-2.5-pro"
+model_name = "gemini-2.5-flash-lite"
 
 @st.cache_resource
 def load_embedder():
@@ -140,9 +140,10 @@ def retriever_node(state: AgentState):
         w1=0.7, # Priority on user's specific keywords
         w2=0.3  # Additional for technical depth/synonyms
     )
+    filtered_ranked_repos = [repo for repo in ranked_repos if repo['semantic_score'] > 0.5]
     
     # Take top 3 for the Architect Node to analyze
-    return {"raw_repos": ranked_repos[:3]}
+    return {"raw_repos": filtered_ranked_repos[:3]}
 
 def architect_node(state: AgentState):
     results = []

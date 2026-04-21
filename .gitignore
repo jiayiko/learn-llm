@@ -1,0 +1,6 @@
+# Ignore entire folder
+github-project-finder/
+
+# Ignore environment and temp files
+.env
+chopa.txt
